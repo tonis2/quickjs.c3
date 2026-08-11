@@ -38,9 +38,6 @@ Then in your `project.json`:
 "dependencies": ["quickjs"]
 ```
 
-The directory has to be named `quickjs.c3l` for `c3c` to find it; the repository is
-named `quickjs.c3` to match the other C3 libraries.
-
 ## What is vendored
 
 Four of quickjs-ng's translation units — `dtoa.c`, `libregexp.c`, `libunicode.c`,
