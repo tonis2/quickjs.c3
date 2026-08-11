@@ -320,3 +320,235 @@ fn void an_async_script_parks_on_the_job_queue() @test
 		(int)js.number(counted), drained);
 	test::@check(drained > 1, "in more than one step, which is what lets a frame be drawn between them");
 }
+
+// ---------------------------------------------------------------------------
+// Host functions: the direction the value crossings run the other way.
+
+// What `counts_up` counts, so the test can prove the opaque pointer arrived and
+// is the caller's own memory rather than a copy.
+struct Tally
+{
+	int calls;
+	double last;
+}
+
+<*
+ Adds its arguments, and records that it was called.
+
+ Deliberately reads `argc` rather than trusting an arity: JS will call a function
+ declared with two parameters using none, and the callback is what has to survive
+ that rather than the engine.
+*>
+fn void adds_up(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	qjs::Context js = qjs::wrap(ctx);
+	Tally* tally = (Tally*)opaque;
+
+	double total = 0;
+	for (int i = 0; i < argc; i++) total += js.number(args[i]);
+
+	if (tally)
+	{
+		tally.calls++;
+		tally.last = total;
+	}
+	*out = qjs::number_value(total);
+}
+
+<*
+ Refuses, the way a host function reports a bad argument.
+*>
+fn void always_refuses(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	qjs::Context js = qjs::wrap(ctx);
+	*out = js.raise("no rig is loaded — call apply_plan first");
+}
+
+<*
+ A function written here is callable from a script, and its answer comes back.
+
+ This is the ABI check run backwards: the arguments arrive as sixteen-byte values
+ the engine wrote and this side reads, where every earlier test had this side
+ writing and the engine reading.
+*>
+fn void a_script_can_call_a_host_function() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	Tally tally;
+	qjs::Value global = js.global();
+	defer js.release(global);
+	js.set_property(global, "addsUp", js.function(&adds_up, "addsUp", 2, &tally));
+
+	qjs::Value? answer = js.eval("addsUp(1, 2) + addsUp(0.5, 0.25, 0.25)");
+	if (catch answer) { test::@check(false, "the script runs"); return; }
+	defer js.release(answer);
+
+	test::@check(math::abs(js.number(answer) - 4.0) < 1e-12,
+		"the host function's answers came back (%.4f, wanted 4)", js.number(answer));
+	test::@check(tally.calls == 2, "it ran twice (%d)", tally.calls);
+	test::@check(math::abs(tally.last - 1.0) < 1e-12,
+		"and wrote through the opaque pointer into the caller's own memory (%.4f)", tally.last);
+}
+
+<*
+ Calling it with nothing is not a crash.
+
+ A declared arity is what `fn.length` reports and nothing more; the engine will
+ happily pass fewer arguments than that, and a callback that indexed `args[0]`
+ on the strength of the declaration would read off the end of the stack frame.
+*>
+fn void a_host_function_survives_being_called_wrong() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	js.set_property(global, "addsUp", js.function(&adds_up, "addsUp", 2));
+
+	qjs::Value? answer = js.eval("[addsUp(), addsUp(7), addsUp(1,2,3,4,5)].join(',')");
+	if (catch answer) { test::@check(false, "the script runs"); return; }
+	defer js.release(answer);
+
+	String text = js.text(answer);
+	defer alloc::free(mem, text.ptr);
+	test::@check(text == "0,7,15", "no arguments, one, and more than declared all work (%s)", text);
+}
+
+<*
+ A host function's refusal is a JS exception the script can catch.
+
+ This is what makes a tool's refusal sentence reach a script's own error
+ handling instead of arriving as a magic return value it has to test for.
+*>
+fn void a_host_refusal_is_a_catchable_error() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	js.set_property(global, "refuses", js.function(&always_refuses, "refuses", 0));
+
+	qjs::Value? caught = js.eval("try { refuses(); 'not reached' } catch (e) { e.message }");
+	if (catch caught) { test::@check(false, "the script runs"); return; }
+	defer js.release(caught);
+
+	String text = js.text(caught);
+	defer alloc::free(mem, text.ptr);
+	test::@check(text == "no rig is loaded — call apply_plan first",
+		"the refusal's own sentence reached the script (%s)", text);
+}
+
+<*
+ And an uncaught one comes back out to the host as a fault.
+*>
+fn void an_uncaught_host_refusal_stops_the_script() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	js.set_property(global, "refuses", js.function(&always_refuses, "refuses", 0));
+
+	qjs::Value? answer = js.eval("globalThis.reached = false; refuses(); globalThis.reached = true;");
+	test::@check(@catch(answer) == qjs::THREW, "the script faulted");
+	if (try answer) js.release(answer);
+
+	String why = js.exception();
+	defer alloc::free(mem, why.ptr);
+	test::@check(why.contains("no rig is loaded"), "carrying the reason (%s)", why);
+
+	qjs::Value again = js.global();
+	defer js.release(again);
+	qjs::Value reached = js.property(again, "reached");
+	defer js.release(reached);
+	test::@check(!js.truth(reached), "and stopped at the throw rather than running on");
+}
+
+<*
+ A whole structure crosses in one piece, both ways.
+
+ The alternative — walking an object property by property from the host side —
+ is what the JSON pair exists to avoid, and it is how a tool's answer gets to a
+ script and a script's answer gets back.
+*>
+fn void a_structure_crosses_as_json() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value? built = js.eval(`({ joint: "LeftFoot", at: [0, 0.5, -0.25], planted: true })`);
+	if (catch built) { test::@check(false, "the script runs"); return; }
+	defer js.release(built);
+
+	String written = js.json(built);
+	defer alloc::free(mem, written.ptr);
+	test::@check(written == `{"joint":"LeftFoot","at":[0,0.5,-0.25],"planted":true}`,
+		"the object came out as JSON (%s)", written);
+
+	qjs::Value? read = js.from_json(`{"stride":1.25,"feet":["L","R"]}`);
+	if (catch read) { test::@check(false, "JSON parses back into a value"); return; }
+	defer js.release(read);
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	js.set_property(global, "measured", js.retain(read));
+
+	qjs::Value? back = js.eval("measured.stride + measured.feet.length");
+	if (catch back) { test::@check(false, "the script reads it"); return; }
+	defer js.release(back);
+	test::@check(math::abs(js.number(back) - 3.25) < 1e-12,
+		"and the script reads it as a real object (%.4f, wanted 3.25)", js.number(back));
+}
+
+<*
+ A value with no JSON form answers empty rather than lying.
+
+ `undefined` is what a script that ends on a statement rather than an expression
+ leaves behind, so this is the common case and not a corner one — a host that
+ read `"undefined"` back would be reporting the four characters as a result.
+*>
+fn void a_value_with_no_json_form_comes_back_empty() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value? nothing = js.eval("void 0");
+	if (catch nothing) { test::@check(false, "the script runs"); return; }
+	defer js.release(nothing);
+
+	String written = js.json(nothing);
+	defer alloc::free(mem, written.ptr);
+	test::@check(written.len == 0, "undefined has no JSON form (%s)", written);
+
+	qjs::Value? nulled = js.eval("null");
+	if (catch nulled) { test::@check(false, "the script runs"); return; }
+	defer js.release(nulled);
+
+	String spelled = js.json(nulled);
+	defer alloc::free(mem, spelled.ptr);
+	test::@check(spelled == "null", "and null is distinguishable from it (%s)", spelled);
+
+	qjs::Value? bad = js.from_json("{not json");
+	test::@check(@catch(bad) == qjs::THREW, "malformed JSON faults");
+	if (try bad) js.release(bad);
+	String why = js.exception();
+	defer alloc::free(mem, why.ptr);
+	test::@check(why.len > 0, "with a reason (%s)", why);
+}

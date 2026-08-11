@@ -70,6 +70,20 @@ alias ContextRef = void*;
 *>
 alias InterruptFn = fn int(Runtime rt, void* opaque);
 
+<*
+ A function written here and called from JavaScript.
+
+ Everything crosses by pointer for the same reason the shim exists: `this_val`
+ and each argument are sixteen bytes the C compiler returns in a register pair,
+ and reproducing that lowering is a bet with a silent loss.
+
+ `this_val` and `args` are **borrowed** — release neither. Whatever is written
+ to `out` is handed to the engine, which owns it afterwards and will release it;
+ a callback that writes nothing returns `undefined`. `wrap` turns `ctx` back
+ into a handle the rest of this module takes.
+*>
+alias HostFn = fn void(ContextRef ctx, Value* this_val, int argc, Value* args, void* opaque, Value* out);
+
 // ---------------------------------------------------------------------------
 // The shim.
 
@@ -112,6 +126,13 @@ extern fn void qjs_global(ContextRef ctx, Value* out);
 extern fn void qjs_new_object(ContextRef ctx, Value* out);
 extern fn void qjs_get_prop(ContextRef ctx, Value* obj, ZString name, Value* out);
 extern fn int qjs_set_prop(ContextRef ctx, Value* obj, ZString name, Value* value);
+
+extern fn void qjs_new_function(ContextRef ctx, HostFn cb, ZString name, int argc, void* opaque, Value* out);
+extern fn void qjs_new_error(ContextRef ctx, ZString message, Value* out);
+extern fn void qjs_throw(ContextRef ctx, Value* v, Value* out);
+
+extern fn void qjs_json_stringify(ContextRef ctx, Value* v, Value* out);
+extern fn void qjs_json_parse(ContextRef ctx, char* buf, usz len, ZString filename, Value* out);
 
 extern fn void qjs_eval(ContextRef ctx, char* src, usz len, ZString filename, int type, Value* out);
 extern fn void qjs_take_exception(ContextRef ctx, Value* out);
@@ -181,6 +202,17 @@ fn void Context.close(&self)
 }
 
 fn bool Context.open_now(&self) => self.ctx != null;
+
+<*
+ The handle for a context somebody else owns — what a `HostFn` is given.
+
+ **Never `close` one of these.** It names the same engine `open` returned, and
+ closing it from inside a call would free the runtime the call is running on.
+*>
+fn Context wrap(ContextRef ctx)
+{
+	return { .runtime = qjs_runtime_of(ctx), .ctx = ctx };
+}
 
 <*
  Release a value. Exactly once, and not after `close`.
@@ -345,6 +377,41 @@ fn bool Context.set_property(&self, Value object, ZString name, Value value)
 	return qjs_set_prop(self.ctx, &object, name, &value) >= 0;
 }
 
+<*
+ `value` as JSON, allocated from `allocator` — the natural way to get a whole
+ structure out in one piece rather than walking it property by property.
+
+ Empty when the value has no JSON form: `undefined`, a function, or a symbol.
+ That is JSON's own answer rather than a failure, and it is why the empty string
+ is not the same as `"null"`. A circular object throws, which arrives here as
+ empty too — call `Context.exception` if the difference matters.
+*>
+fn String Context.json(&self, Value value, Allocator allocator = mem)
+{
+	Value text;
+	qjs_json_stringify(self.ctx, &value, &text);
+	defer self.release(text);
+	if (qjs_is_exception(&text) != 0 || qjs_is_undefined(&text) != 0) return "".copy(allocator);
+	return self.text(text, allocator);
+}
+
+<*
+ `text` parsed as JSON, owned by the caller — the same crossing the other way.
+
+ @param name : `What a parse error calls the source. Never opened.`
+ @return? THREW : `Malformed JSON; Context.exception says where.`
+*>
+fn Value? Context.from_json(&self, String text, String name = "<json>")
+{
+	ZString named = name.zstr_copy(mem);
+	defer alloc::free(mem, (void*)named);
+
+	Value out;
+	qjs_json_parse(self.ctx, text.ptr, text.len, named, &out);
+	if (qjs_is_exception(&out) != 0) return THREW~;
+	return out;
+}
+
 fn Value Context.string(&self, String text)
 {
 	Value out;
@@ -377,6 +444,56 @@ fn Value undefined_value()
 {
 	Value out;
 	qjs_undefined(&out);
+	return out;
+}
+
+<*
+ A JS function that calls `body`, owned by the caller — install it with
+ `set_property`, which takes that ownership over.
+
+ 	`js.set_property(global, "hypot", js.function(&hypot, "hypot", 2));`
+
+ @param name : `What the function calls itself. Shows up in stack traces and in String(fn), and nothing looks it up by it.`
+ @param arity : `The argument count JS reports as fn.length. Not a limit — a call may pass any number, and the callback is told how many arrived.`
+ @param opaque : `Handed back to the callback untouched. Must outlive the function, which lives until the context closes or the value is collected.`
+*>
+fn Value Context.function(&self, HostFn body, ZString name, int arity = 0, void* opaque = null)
+{
+	Value out;
+	qjs_new_function(self.ctx, body, name, arity, opaque, &out);
+	return out;
+}
+
+<*
+ An `Error` carrying `message`, owned by the caller. Usually wanted as `raise`,
+ which throws it in the same breath.
+*>
+fn Value Context.error(&self, String message)
+{
+	ZString text = message.zstr_copy(mem);
+	defer alloc::free(mem, (void*)text);
+
+	Value out;
+	qjs_new_error(self.ctx, text, &out);
+	return out;
+}
+
+<*
+ Throw an `Error` carrying `message`, and hand back what a `HostFn` returns
+ having done so:
+
+ 	`*out = js.raise("no rig is loaded");`
+ 	`return;`
+
+ The value is the engine's exception marker, not the error object — the error is
+ pending on the context, where a `catch` in the script or `Context.exception`
+ outside it will find it.
+*>
+fn Value Context.raise(&self, String message)
+{
+	Value thrown = self.error(message);
+	Value out;
+	qjs_throw(self.ctx, &thrown, &out);
 	return out;
 }
 

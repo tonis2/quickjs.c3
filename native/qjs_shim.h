@@ -86,6 +86,44 @@ void qjs_get_prop(JSContext *ctx, const QjsValue *obj, const char *name, QjsValu
 /* Takes ownership of *value, as JS_SetPropertyStr does. */
 int qjs_set_prop(JSContext *ctx, const QjsValue *obj, const char *name, const QjsValue *value);
 
+/* --- host functions ----------------------------------------------------- */
+
+/*
+ * A function written on the host side and called from JavaScript.
+ *
+ * `this_val` and `argv` are borrowed — do not release them. `out` is where the
+ * return value goes, and it is owned by the engine once written. `opaque` is
+ * whatever was handed to qjs_new_function.
+ */
+typedef void qjs_host_fn(JSContext *ctx, const QjsValue *this_val, int argc,
+                         const QjsValue *argv, void *opaque, QjsValue *out);
+
+/*
+ * A JS function that calls `cb`. `argc` is the arity JS reports, not a limit —
+ * a call may pass fewer or more, and the callback is told how many arrived.
+ */
+void qjs_new_function(JSContext *ctx, qjs_host_fn *cb, const char *name,
+                      int argc, void *opaque, QjsValue *out);
+
+/* --- errors ------------------------------------------------------------- */
+
+/* An Error object with `message` set, owned by the caller. */
+void qjs_new_error(JSContext *ctx, const char *message, QjsValue *out);
+
+/* Throw *v, which is consumed. `out` receives the exception sentinel, which is
+   what a host function returns after throwing. */
+void qjs_throw(JSContext *ctx, const QjsValue *v, QjsValue *out);
+
+/* --- JSON --------------------------------------------------------------- */
+
+/* JSON.stringify(v). Undefined when the value has no JSON form — a function, or
+   `undefined` itself. */
+void qjs_json_stringify(JSContext *ctx, const QjsValue *v, QjsValue *out);
+
+/* JSON.parse. Exception on malformed input. */
+void qjs_json_parse(JSContext *ctx, const char *buf, size_t len,
+                    const char *filename, QjsValue *out);
+
 /* --- evaluating --------------------------------------------------------- */
 
 #define QJS_EVAL_GLOBAL 0

@@ -1,3 +1,5 @@
+#include <stdlib.h>
+
 #include "qjs_shim.h"
 #include "quickjs.h"
 
@@ -103,6 +105,78 @@ void qjs_get_prop(JSContext *ctx, const QjsValue *obj, const char *name, QjsValu
 int qjs_set_prop(JSContext *ctx, const QjsValue *obj, const char *name, const QjsValue *value)
 {
     return JS_SetPropertyStr(ctx, in(obj), name, in(value));
+}
+
+/* --- host functions ----------------------------------------------------- */
+
+/* JS_NewCClosure carries one void* and calls a finalizer on it when the function
+   is collected, so the pair below is heap-allocated and freed there rather than
+   parked in a table that would have to be sized and never emptied. */
+typedef struct Closure { qjs_host_fn *cb; void *opaque; } Closure;
+
+static void closure_release(void *p) { free(p); }
+
+static JSValue closure_enter(JSContext *ctx, JSValueConst this_val, int argc,
+                             JSValueConst *argv, int magic, void *opaque)
+{
+    Closure *closure = (Closure *)opaque;
+    QjsValue self, result;
+    (void)magic;
+
+    /* Borrowed, so copied rather than duplicated: the callback is handed the
+       same reference the engine holds and must not release it. argv is an array
+       of JSValue and QjsValue is the same sixteen bytes, so it goes across as
+       a pointer with no copy at all. */
+    out(this_val, &self);
+    /* So a callback that writes nothing returns `undefined`, which is what JS
+       means by no answer. Zeroed bytes would be a tagged integer 0. */
+    out(JS_UNDEFINED, &result);
+    closure->cb(ctx, &self, argc, (const QjsValue *)argv, closure->opaque, &result);
+    return in(&result);
+}
+
+void qjs_new_function(JSContext *ctx, qjs_host_fn *cb, const char *name,
+                      int argc, void *opaque, QjsValue *slot)
+{
+    Closure *closure = (Closure *)malloc(sizeof(Closure));
+    if (closure == NULL)
+    {
+        out(JS_ThrowOutOfMemory(ctx), slot);
+        return;
+    }
+    closure->cb = cb;
+    closure->opaque = opaque;
+    out(JS_NewCClosure(ctx, closure_enter, name, closure_release, argc, 0, closure), slot);
+}
+
+/* --- errors ------------------------------------------------------------- */
+
+void qjs_new_error(JSContext *ctx, const char *message, QjsValue *slot)
+{
+    JSValue error = JS_NewError(ctx);
+    if (!JS_IsException(error))
+    {
+        JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, message));
+    }
+    out(error, slot);
+}
+
+void qjs_throw(JSContext *ctx, const QjsValue *v, QjsValue *slot)
+{
+    out(JS_Throw(ctx, in(v)), slot);
+}
+
+/* --- JSON --------------------------------------------------------------- */
+
+void qjs_json_stringify(JSContext *ctx, const QjsValue *v, QjsValue *slot)
+{
+    out(JS_JSONStringify(ctx, in(v), JS_UNDEFINED, JS_UNDEFINED), slot);
+}
+
+void qjs_json_parse(JSContext *ctx, const char *buf, size_t len,
+                    const char *filename, QjsValue *slot)
+{
+    out(JS_ParseJSON(ctx, buf, len, filename), slot);
 }
 
 /* --- evaluating --------------------------------------------------------- */
