@@ -1,0 +1,34 @@
+{
+  "provides": "quickjs",
+  "sources": ["src/**"],
+  // quickjs-ng's four translation units plus the flat shim in native/qjs_shim.c.
+  // c3c compiles these itself — no static library is built and none is checked in,
+  // which is why there is no lib/<arch> here and no build script to run first.
+  //
+  // Named one by one: c3c hands each entry to the C compiler verbatim, so a glob
+  // arrives as a literal `*.c` and clang answers "no such file or directory".
+  "c-sources": [
+    "native/dtoa.c",
+    "native/libregexp.c",
+    "native/libunicode.c",
+    "native/quickjs.c",
+    "native/qjs_shim.c"
+  ],
+  "c-include-dirs": ["native"],
+  // -O2: quickjs is an interpreter and the default is unusably slow.
+  // _GNU_SOURCE is what its own CMakeLists sets for every platform.
+  // The -Wno- pairs are quickjs's own style, not defects: it leans on unused
+  // parameters in its handler tables and on braces the compiler would rather see
+  // spelled out. Left as warnings they bury a real one from crig's side.
+  "cflags": "-O2 -std=c11 -D_GNU_SOURCE -funsigned-char -Wno-unused-parameter -Wno-missing-braces -Wno-sign-compare -Wno-unused-but-set-variable -Wno-implicit-fallthrough",
+  "targets": {
+    // c3c links macOS binaries for 11.0 while cc defaults to the running SDK, so
+    // every object here would otherwise draw a "built for newer macOS" warning
+    // from ld — five of them, on every build, burying anything real.
+    "macos-x64": { "cflags": "-mmacosx-version-min=11.0" },
+    "macos-aarch64": { "cflags": "-mmacosx-version-min=11.0" },
+    "linux-x64": {},
+    "linux-aarch64": {},
+    "windows-x64": {}
+  }
+}

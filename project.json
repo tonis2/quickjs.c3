@@ -1,0 +1,28 @@
+{
+  // Standalone build, for developing and testing the binding on its own.
+  // Consumers get `manifest.json` instead, which carries the same C sources and
+  // flags — the two must be kept in step.
+  "langrev": "1",
+  "warnings": ["no-unused"],
+  "authors": [],
+  "version": "0.1.0",
+  "dependency-search-paths": [],
+  "dependencies": [],
+  "sources": ["src/**"],
+  "test-sources": ["test/**"],
+  "c-sources": [
+    "native/dtoa.c",
+    "native/libregexp.c",
+    "native/libunicode.c",
+    "native/quickjs.c",
+    "native/qjs_shim.c"
+  ],
+  "c-include-dirs": ["native"],
+  "cflags": "-O2 -std=c11 -D_GNU_SOURCE -funsigned-char -Wno-unused-parameter -Wno-missing-braces -Wno-sign-compare -Wno-unused-but-set-variable -Wno-implicit-fallthrough",
+  "targets": {
+    "quickjs": {
+      "type": "static-lib"
+    }
+  },
+  "output": "./build"
+}
