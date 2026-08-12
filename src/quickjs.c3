@@ -46,6 +46,15 @@ const int TAG_FLOAT64 = 8;
 const int EVAL_GLOBAL = 0;
 const int EVAL_MODULE = 1;
 
+// The element types `Context.typed_array` can lay over a buffer. Only the ones
+// a host has data in are named; the enum they come from has twelve entries and
+// the other seven exist for JavaScript's benefit rather than a binding's.
+const int ARRAY_UINT8 = 2;
+const int ARRAY_INT32 = 5;
+const int ARRAY_UINT32 = 6;
+const int ARRAY_FLOAT32 = 10;
+const int ARRAY_FLOAT64 = 11;
+
 <*
  One JavaScript value, sixteen opaque bytes.
 
@@ -126,6 +135,18 @@ extern fn void qjs_global(ContextRef ctx, Value* out);
 extern fn void qjs_new_object(ContextRef ctx, Value* out);
 extern fn void qjs_get_prop(ContextRef ctx, Value* obj, ZString name, Value* out);
 extern fn int qjs_set_prop(ContextRef ctx, Value* obj, ZString name, Value* value);
+extern fn void qjs_new_object_proto(ContextRef ctx, Value* proto, Value* out);
+extern fn int qjs_define_getset(ContextRef ctx, Value* obj, ZString name, Value* getter, Value* setter);
+
+extern fn void qjs_new_array(ContextRef ctx, Value* out);
+extern fn int qjs_set_index(ContextRef ctx, Value* obj, uint index, Value* value);
+extern fn void qjs_get_index(ContextRef ctx, Value* obj, uint index, Value* out);
+extern fn int qjs_length(ContextRef ctx, Value* obj, long* out);
+
+extern fn void qjs_new_buffer(ContextRef ctx, char* data, usz len, Value* out);
+extern fn void qjs_detach_buffer(ContextRef ctx, Value* buffer);
+extern fn int qjs_freeze_buffer(Value* buffer);
+extern fn void qjs_new_typed_array(ContextRef ctx, int kind, Value* buffer, usz offset, usz count, Value* out);
 
 extern fn void qjs_new_function(ContextRef ctx, HostFn cb, ZString name, int argc, void* opaque, Value* out);
 extern fn void qjs_new_error(ContextRef ctx, ZString message, Value* out);
@@ -419,6 +440,158 @@ fn Value Context.string(&self, String text)
 	return out;
 }
 
+<*
+ An empty object, owned by the caller.
+*>
+fn Value Context.object(&self)
+{
+	Value out;
+	qjs_new_object(self.ctx, &out);
+	return out;
+}
+
+<*
+ An object with `proto` behind it, owned by the caller.
+
+ The prototype is **borrowed**, so one object can stand behind any number of
+ these — which is what makes a host-side class: the accessors are defined once
+ on the prototype and every instance carries only its own identity.
+*>
+fn Value Context.object_of(&self, Value proto)
+{
+	Value out;
+	qjs_new_object_proto(self.ctx, &proto, &out);
+	return out;
+}
+
+<*
+ Define `name` as an accessor: reading it calls `getter`, assigning to it calls
+ `setter`.
+
+ 	`js.accessor(proto, "position", js.function(&read_position, "position", 0, run),`
+ 	`            js.function(&write_position, "position", 1, run));`
+
+ **Takes ownership of both**, the same way `set_property` does. Pass
+ `undefined_value()` for the setter to make the property read-only — an
+ assignment then throws in strict mode and is quietly dropped outside it, which
+ is JavaScript's own rule for a getter with no setter.
+
+ @return `False when the property could not be defined.`
+*>
+fn bool Context.accessor(&self, Value object, ZString name, Value getter, Value setter = undefined_value())
+{
+	return qjs_define_getset(self.ctx, &object, name, &getter, &setter) >= 0;
+}
+
+<*
+ An empty array, owned by the caller.
+*>
+fn Value Context.array(&self)
+{
+	Value out;
+	qjs_new_array(self.ctx, &out);
+	return out;
+}
+
+<*
+ Set `array[index]`. **Takes ownership of `value`.**
+*>
+fn bool Context.set_index(&self, Value array, uint index, Value value)
+{
+	return qjs_set_index(self.ctx, &array, index, &value) >= 0;
+}
+
+<*
+ `array[index]`, owned by the caller. Undefined when there is no such element.
+*>
+fn Value Context.index(&self, Value array, uint index)
+{
+	Value out;
+	qjs_get_index(self.ctx, &array, index, &out);
+	return out;
+}
+
+<*
+ `value.length` as JavaScript reads it, which answers for anything array-like
+ and not only for a real array.
+
+ @return `-1 when the value has no length, which includes the case where asking for one threw.`
+*>
+fn long Context.length(&self, Value value)
+{
+	long out = 0;
+	if (qjs_length(self.ctx, &value, &out) != 0) return -1;
+	return out;
+}
+
+<*
+ An `ArrayBuffer` over memory the host owns, owned by the caller.
+
+ Nothing is copied: this is the whole point of it, and the whole hazard. The
+ engine is told the memory is not its to manage, so it will neither free nor
+ resize nor move it — and it has no idea when the host does. **Detach the buffer
+ before the memory goes away**, which turns every view of it into a `TypeError`
+ at that moment rather than a read of released pages some time later.
+
+ 	`Value buffer = js.buffer((char*)mesh.positions.ptr, @sizeof(mesh.positions[0]) * mesh.positions.len);`
+ 	`Value view = js.typed_array(qjs::ARRAY_FLOAT32, buffer, 0, mesh.positions.len * 3);`
+*>
+fn Value Context.buffer(&self, char* data, usz bytes)
+{
+	Value out;
+	qjs_new_buffer(self.ctx, data, bytes, &out);
+	return out;
+}
+
+<*
+ Detach a buffer: every typed array over it becomes unusable, and reading one
+ throws `TypeError: detached ArrayBuffer`.
+
+ Idempotent, and harmless on a value that is not a buffer at all.
+*>
+fn void Context.detach(&self, Value buffer)
+{
+	qjs_detach_buffer(self.ctx, &buffer);
+}
+
+<*
+ Make a buffer read-only: no write through any view of it reaches the memory.
+
+ The other half of what makes sharing the host's memory safe. Zero-copy means a
+ script can *see* the host's arrays; without this it could also change them,
+ behind whatever bookkeeping the host keeps about them. Detaching still works —
+ read-only is about the script, not about the host.
+
+ **How the refusal reads in JavaScript differs by route**, and it is worth
+ knowing which. `view[0] = 1` is dropped silently, in strict mode as well as
+ outside it — the engine refuses it in the element fast path, so there is no
+ failed `[[Set]]` for `use strict` to turn into a throw. The bulk methods
+ (`set`, `fill`, `copyWithin`, `sort`) throw
+ `TypeError: ArrayBuffer is immutable`. Both leave the memory alone, which is
+ the guarantee; only one of them says so out loud.
+
+ @return `False when the value is not an ArrayBuffer.`
+*>
+fn bool Context.freeze(&self, Value buffer)
+{
+	return qjs_freeze_buffer(&buffer) == 0;
+}
+
+<*
+ A typed array over `buffer`, owned by the caller — what a script actually
+ reads. The buffer is **borrowed** and stays the caller's to release.
+
+ @param kind : `One of the ARRAY_* constants: the element type to read the bytes as.`
+ @param offset : `Where the view starts, in elements of that kind.`
+ @param count : `How many elements it covers.`
+*>
+fn Value Context.typed_array(&self, int kind, Value buffer, usz offset, usz count)
+{
+	Value out;
+	qjs_new_typed_array(self.ctx, kind, &buffer, offset, count, &out);
+	return out;
+}
+
 fn Value number_value(double d)
 {
 	Value out;
@@ -444,6 +617,17 @@ fn Value undefined_value()
 {
 	Value out;
 	qjs_undefined(&out);
+	return out;
+}
+
+<*
+ `null` — which a host means when there is nothing rather than when it was not
+ asked, and which JSON carries where `undefined` disappears.
+*>
+fn Value null_value()
+{
+	Value out;
+	qjs_null(&out);
 	return out;
 }
 

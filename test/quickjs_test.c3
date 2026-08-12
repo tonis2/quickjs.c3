@@ -552,3 +552,235 @@ fn void a_value_with_no_json_form_comes_back_empty() @test
 	defer alloc::free(mem, why.ptr);
 	test::@check(why.len > 0, "with a reason (%s)", why);
 }
+
+// ---------------------------------------------------------------------------
+// Accessors, arrays and shared memory — the surface a host-side data layer is
+// built from, as against the function-call surface above.
+
+// What the accessor pair below reads and writes, and its own record of having
+// been asked. A property that is really a function call is the whole point, so
+// the counts are the check that it was one.
+struct Reading @local
+{
+	double value;
+	int reads;
+	int writes;
+}
+
+fn void read_reach(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	Reading* held = (Reading*)opaque;
+	held.reads++;
+	*out = qjs::number_value(held.value);
+}
+
+fn void write_reach(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	qjs::Context js = qjs::wrap(ctx);
+	Reading* held = (Reading*)opaque;
+	held.writes++;
+	if (argc > 0) held.value = js.number(args[0]);
+}
+
+<*
+ A property that is a pair of host calls, defined once on a prototype.
+
+ This is what lets a host hand out a handle rather than a copy: `dot.reach` reads
+ the document at the moment it is asked, and `dot.reach = x` is an edit. The
+ counts matter as much as the value — a plain data property would give the same
+ arithmetic and none of the calls.
+*>
+fn void a_property_can_be_a_pair_of_host_calls() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	Reading held = { .value = 0.25 };
+
+	qjs::Value proto = js.object();
+	test::@check(js.accessor(proto, "reach",
+		js.function(&read_reach, "reach", 0, &held),
+		js.function(&write_reach, "reach", 1, &held)), "the accessor is defined");
+
+	// Two objects over one prototype, which is the arrangement being checked:
+	// the pair is defined once and every instance gets it.
+	qjs::Value first = js.object_of(proto);
+	qjs::Value second = js.object_of(proto);
+	js.release(proto);
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	js.set_property(global, "first", first);
+	js.set_property(global, "second", second);
+
+	qjs::Value? answer = js.eval("first.reach = first.reach * 2; second.reach");
+	if (catch answer) { test::@check(false, "the script runs"); return; }
+	defer js.release(answer);
+
+	test::@check(math::abs(js.number(answer) - 0.5) < 1e-12,
+		"the second object sees what was written through the first (%.4f, wanted 0.5)",
+		js.number(answer));
+	test::@check(held.writes == 1, "the setter ran once (%d)", held.writes);
+	test::@check(held.reads == 2, "and the getter twice (%d)", held.reads);
+}
+
+<*
+ A host-built array is an ordinary JavaScript array.
+
+ Which is what makes `for (const dot of crig.data.dots)` work with nothing
+ written on the JS side to make it work.
+*>
+fn void a_host_built_array_is_an_ordinary_array() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value names = js.array();
+	js.set_index(names, 0, js.string("Hips"));
+	js.set_index(names, 1, js.string("Spine"));
+	js.set_index(names, 2, js.string("Head"));
+	test::@check(js.length(names) == 3, "the host reads its own length back (%d)", js.length(names));
+
+	qjs::Value second = js.index(names, 1);
+	defer js.release(second);
+	String read = js.text(second);
+	defer alloc::free(mem, read.ptr);
+	test::@check(read == "Spine", "and one element of it (%s)", read);
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	js.set_property(global, "names", names);
+
+	qjs::Value? joined = js.eval(`[...names].map(n => n.toLowerCase()).join("/")`);
+	if (catch joined) { test::@check(false, "the script spreads and maps it"); return; }
+	defer js.release(joined);
+
+	String text = js.text(joined);
+	defer alloc::free(mem, text.ptr);
+	test::@check(text == "hips/spine/head", "the script sees a real array (%s)", text);
+}
+
+<*
+ A typed array over the host's own memory, and what happens when that memory
+ goes away.
+
+ Zero-copy is the reason for it: a mesh's positions are megabytes and a script
+ that wants to measure them should not pay for a JSON copy of them. The hazard is
+ the same fact from the other side — the engine has no idea when the host frees
+ the pages — so the check that matters is the second half: detaching turns every
+ view into a `TypeError` at the moment it happens, rather than a read of released
+ memory some time later.
+*>
+fn void a_typed_array_shares_the_hosts_memory_until_it_is_detached() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	float[6] samples = { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f, 1.25f };
+
+	qjs::Value buffer = js.buffer((char*)&samples[0], @sizeof(samples));
+	defer js.release(buffer);
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	js.set_property(global, "samples", js.typed_array(qjs::ARRAY_FLOAT32, buffer, 0, 6));
+
+	qjs::Value? total = js.eval("samples.reduce((a, b) => a + b, 0)");
+	if (catch total) { test::@check(false, "the script reads the array"); return; }
+	defer js.release(total);
+	test::@check(math::abs(js.number(total) - 3.75) < 1e-6,
+		"the script sums the host's own floats (%.4f, wanted 3.75)", js.number(total));
+
+	qjs::Value? wrote = js.eval("samples[0] = 9; samples.length");
+	if (catch wrote) { test::@check(false, "the script writes into it"); return; }
+	defer js.release(wrote);
+	test::@check(samples[0] == 9.0f, "and the write lands in the host's array (%.4f)", (double)samples[0]);
+	test::@check(js.number(wrote) == 6.0, "with the length the host gave it (%.0f)", js.number(wrote));
+
+	// The moment the host would free or replace the memory.
+	js.detach(buffer);
+
+	qjs::Value? after = js.eval("samples.length");
+	if (catch after) { test::@check(false, "reading the length of a detached view is not itself a throw"); return; }
+	defer js.release(after);
+	test::@check(js.number(after) == 0.0, "a detached view has no elements (%.0f)", js.number(after));
+
+	qjs::Value? refused = js.eval("samples.reduce((a, b) => a + b, 0)");
+	test::@check(@catch(refused) == qjs::THREW, "and using one throws rather than reading freed memory");
+	if (try refused) js.release(refused);
+
+	String why = js.exception();
+	defer alloc::free(mem, why.ptr);
+	test::@check(why.contains("TypeError"), "as a TypeError (%s)", why);
+
+	// Twice, because the host detaches every buffer it handed out when the thing
+	// behind them is replaced and cannot know which are already gone.
+	js.detach(buffer);
+}
+
+<*
+ A shared buffer the script can read and cannot change.
+
+ Sharing memory means a script sees the host's arrays; it should not also mean it
+ can write into them behind whatever bookkeeping the host keeps — a mesh's
+ vertices moved from JavaScript would be an edit with no undo and no rebind
+ behind it. Read-only says so at the point of the write rather than in a
+ paragraph nobody read.
+*>
+fn void a_frozen_buffer_can_be_read_but_not_written() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	uint[3] counts = { 4, 5, 6 };
+
+	qjs::Value buffer = js.buffer((char*)&counts[0], @sizeof(counts));
+	defer js.release(buffer);
+	test::@check(js.freeze(buffer), "the buffer is made read-only");
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	js.set_property(global, "counts", js.typed_array(qjs::ARRAY_UINT32, buffer, 0, 3));
+
+	qjs::Value? read = js.eval("counts[1]");
+	if (catch read) { test::@check(false, "the script still reads it"); return; }
+	defer js.release(read);
+	test::@check(js.number(read) == 5.0, "reading is unaffected (%.0f)", js.number(read));
+
+	// Sloppy mode first, because that is what a script written without ceremony
+	// runs in: JavaScript's own rule for a refused write is to drop it silently.
+	qjs::Value? dropped = js.eval("counts[1] = 99; counts[1]");
+	if (catch dropped) { test::@check(false, "a refused write is not a throw outside strict mode"); return; }
+	defer js.release(dropped);
+	test::@check(js.number(dropped) == 5.0, "the write did not land (%.0f)", js.number(dropped));
+
+	// And strict mode is the same answer, not a louder one: the engine refuses
+	// the element write in its fast path rather than reporting a failed [[Set]]
+	// back to the assignment, so there is nothing for `use strict` to turn into a
+	// throw. Worth pinning down, because "read-only" that quietly succeeded would
+	// be far worse than one that quietly fails.
+	qjs::Value? strict = js.eval(`"use strict"; counts[1] = 99; counts[1]`);
+	if (catch strict) { test::@check(false, "strict mode runs"); return; }
+	defer js.release(strict);
+	test::@check(js.number(strict) == 5.0, "strict mode drops it too (%.0f)", js.number(strict));
+
+	test::@check(counts[1] == 5, "the host's array is untouched either way (%d)", counts[1]);
+
+	// The bulk methods do throw, which is where a script that ignored the above
+	// finds out.
+	qjs::Value? refused = js.eval("counts.set([1, 2, 3])");
+	test::@check(@catch(refused) == qjs::THREW, "and TypedArray.set refuses outright");
+	if (try refused) js.release(refused);
+
+	String why = js.exception();
+	defer alloc::free(mem, why.ptr);
+	test::@check(why.contains("immutable"), "saying which buffer it is (%s)", why);
+}

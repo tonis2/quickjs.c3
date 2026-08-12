@@ -86,6 +86,52 @@ void qjs_get_prop(JSContext *ctx, const QjsValue *obj, const char *name, QjsValu
 /* Takes ownership of *value, as JS_SetPropertyStr does. */
 int qjs_set_prop(JSContext *ctx, const QjsValue *obj, const char *name, const QjsValue *value);
 
+/* A new object whose prototype is *proto. The prototype is borrowed, so one
+   object may be the prototype of any number of these. */
+void qjs_new_object_proto(JSContext *ctx, const QjsValue *proto, QjsValue *out);
+
+/*
+ * Define `name` as an accessor rather than a slot: reading it calls *getter and
+ * assigning to it calls *setter. Both are consumed; pass undefined for either
+ * to leave that half absent, which is how a read-only property is made.
+ *
+ * Defined on a prototype, one pair serves every object made from it — which is
+ * the whole reason a host-side class is cheaper than a property per instance.
+ */
+int qjs_define_getset(JSContext *ctx, const QjsValue *obj, const char *name,
+                      const QjsValue *getter, const QjsValue *setter);
+
+/* --- arrays ------------------------------------------------------------- */
+
+void qjs_new_array(JSContext *ctx, QjsValue *out);
+/* Takes ownership of *value. */
+int qjs_set_index(JSContext *ctx, const QjsValue *obj, uint32_t index, const QjsValue *value);
+void qjs_get_index(JSContext *ctx, const QjsValue *obj, uint32_t index, QjsValue *out);
+/* `obj.length` as JS reads it, which works for anything array-like. 0 on success. */
+int qjs_length(JSContext *ctx, const QjsValue *obj, int64_t *out);
+
+/* --- binary ------------------------------------------------------------- */
+
+/*
+ * An ArrayBuffer over memory the host owns.
+ *
+ * Nothing is copied and nothing is freed when the buffer is collected — the
+ * engine is told the memory is not its to manage. **Detach it before that
+ * memory goes away**, which turns every view of it into a TypeError at the
+ * moment it happens rather than a read of released pages later.
+ */
+void qjs_new_buffer(JSContext *ctx, uint8_t *data, size_t len, QjsValue *out);
+void qjs_detach_buffer(JSContext *ctx, const QjsValue *buffer);
+
+/* Make a buffer read-only: a write through any view of it throws a TypeError.
+   0 on success, -1 if it is not an ArrayBuffer. Detaching still works. */
+int qjs_freeze_buffer(const QjsValue *buffer);
+
+/* A typed array over `buffer`, which is borrowed. `kind` is a JSTypedArrayEnum;
+   `offset` and `count` are in elements of that kind, not bytes. */
+void qjs_new_typed_array(JSContext *ctx, int kind, const QjsValue *buffer,
+                         size_t offset, size_t count, QjsValue *out);
+
 /* --- host functions ----------------------------------------------------- */
 
 /*

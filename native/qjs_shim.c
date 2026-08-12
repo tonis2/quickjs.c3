@@ -107,6 +107,85 @@ int qjs_set_prop(JSContext *ctx, const QjsValue *obj, const char *name, const Qj
     return JS_SetPropertyStr(ctx, in(obj), name, in(value));
 }
 
+void qjs_new_object_proto(JSContext *ctx, const QjsValue *proto, QjsValue *slot)
+{
+    out(JS_NewObjectProto(ctx, in(proto)), slot);
+}
+
+int qjs_define_getset(JSContext *ctx, const QjsValue *obj, const char *name,
+                      const QjsValue *getter, const QjsValue *setter)
+{
+    JSAtom atom = JS_NewAtom(ctx, name);
+    int ok;
+
+    if (atom == JS_ATOM_NULL)
+    {
+        JS_FreeValue(ctx, in(getter));
+        JS_FreeValue(ctx, in(setter));
+        return -1;
+    }
+
+    /* Enumerable so that Object.keys and a for-in see the same shape a plain
+       object would show; configurable so a prelude written in JS can wrap one. */
+    ok = JS_DefinePropertyGetSet(ctx, in(obj), atom, in(getter), in(setter),
+                                 JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
+    JS_FreeAtom(ctx, atom);
+    return ok;
+}
+
+/* --- arrays ------------------------------------------------------------- */
+
+void qjs_new_array(JSContext *ctx, QjsValue *slot) { out(JS_NewArray(ctx), slot); }
+
+int qjs_set_index(JSContext *ctx, const QjsValue *obj, uint32_t index, const QjsValue *value)
+{
+    return JS_SetPropertyUint32(ctx, in(obj), index, in(value));
+}
+
+void qjs_get_index(JSContext *ctx, const QjsValue *obj, uint32_t index, QjsValue *slot)
+{
+    out(JS_GetPropertyUint32(ctx, in(obj), index), slot);
+}
+
+int qjs_length(JSContext *ctx, const QjsValue *obj, int64_t *res)
+{
+    return JS_GetLength(ctx, in(obj), res);
+}
+
+/* --- binary ------------------------------------------------------------- */
+
+void qjs_new_buffer(JSContext *ctx, uint8_t *data, size_t len, QjsValue *slot)
+{
+    /* NULL realloc_func is the engine's own way of saying the memory is not
+       managed here: it is neither freed nor resized nor transferred. */
+    out(JS_NewArrayBuffer(ctx, data, len, 0, NULL, NULL, false), slot);
+}
+
+void qjs_detach_buffer(JSContext *ctx, const QjsValue *buffer)
+{
+    JS_DetachArrayBuffer(ctx, in(buffer));
+}
+
+int qjs_freeze_buffer(const QjsValue *buffer)
+{
+    return JS_SetImmutableArrayBuffer(in(buffer), true);
+}
+
+void qjs_new_typed_array(JSContext *ctx, int kind, const QjsValue *buffer,
+                         size_t offset, size_t count, QjsValue *slot)
+{
+    /* The same arguments `new Float32Array(buffer, offset, count)` takes, and
+       borrowed the way that call's arguments are — the buffer stays the
+       caller's. */
+    JSValue argv[3];
+    argv[0] = in(buffer);
+    argv[1] = JS_NewInt64(ctx, (int64_t)offset);
+    argv[2] = JS_NewInt64(ctx, (int64_t)count);
+    out(JS_NewTypedArray(ctx, 3, argv, (JSTypedArrayEnum)kind), slot);
+    JS_FreeValue(ctx, argv[1]);
+    JS_FreeValue(ctx, argv[2]);
+}
+
 /* --- host functions ----------------------------------------------------- */
 
 /* JS_NewCClosure carries one void* and calls a finalizer on it when the function
