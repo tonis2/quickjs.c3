@@ -1,34 +1,67 @@
 {
   "provides": "quickjs",
   "sources": ["src/**"],
-  // quickjs-ng's four translation units plus the flat shim in native/qjs_shim.c.
-  // c3c compiles these itself — no static library is built and none is checked in,
-  // which is why there is no lib/<arch> here and no build script to run first.
+  // Only the shim is compiled from source. quickjs-ng's own four translation
+  // units are frozen into lib/<target>/libquickjs.a by native/build-quickjs.sh
+  // and linked, because c3c has no object cache: as `c-sources` they were
+  // recompiled on *every* build of the consuming app, including builds that
+  // changed nothing, and quickjs.c alone is 2 MB of C — 4.2 s at -O2.
   //
-  // Named one by one: c3c hands each entry to the C compiler verbatim, so a glob
-  // arrives as a literal `*.c` and clang answers "no such file or directory".
+  // The shim stays a source: it is the file this binding actually edits, it
+  // compiles in 0.03 s, and archiving it would mean every change to it needed
+  // the script run first, silently linking the old code until someone noticed.
+  //
+  // Named one by one rather than globbed: c3c hands each entry to the C
+  // compiler verbatim, so `*.c` arrives literally and clang answers "no such
+  // file or directory".
   "c-sources": [
-    "native/dtoa.c",
-    "native/libregexp.c",
-    "native/libunicode.c",
-    "native/quickjs.c",
     "native/qjs_shim.c"
   ],
-  "c-include-dirs": ["native"],
+  // quickjs-ng is a git submodule at vendor/quickjs-ng, not a copy — `git clone
+  // --recursive` (or `git submodule update --init --recursive`) brings it in, and
+  // the gitlink records the exact upstream commit that the archives were built
+  // from. The shim `#include "quickjs.h"`, so this path is needed even though
+  // the engine itself is linked rather than compiled.
+  "c-include-dirs": ["native", "vendor/quickjs-ng"],
   // -O2: quickjs is an interpreter and the default is unusably slow.
   // _GNU_SOURCE is what its own CMakeLists sets for every platform.
   // The -Wno- pairs are quickjs's own style, not defects: it leans on unused
   // parameters in its handler tables and on braces the compiler would rather see
   // spelled out. Left as warnings they bury a real one from crig's side.
+  // build-quickjs.sh passes the same set, and the two must be kept in step.
   "cflags": "-O2 -std=c11 -D_GNU_SOURCE -funsigned-char -Wno-unused-parameter -Wno-missing-braces -Wno-sign-compare -Wno-unused-but-set-variable -Wno-implicit-fallthrough",
+  // Per-target native libraries live under lib/<target>/ rather than the
+  // default <target>/ at the library root.
+  "linklib-dir": "lib",
   "targets": {
     // c3c links macOS binaries for 11.0 while cc defaults to the running SDK, so
-    // every object here would otherwise draw a "built for newer macOS" warning
-    // from ld — five of them, on every build, burying anything real.
-    "macos-x64": { "cflags": "-mmacosx-version-min=11.0" },
-    "macos-aarch64": { "cflags": "-mmacosx-version-min=11.0" },
-    "linux-x64": {},
-    "linux-aarch64": {},
-    "windows-x64": {}
+    // the shim object would otherwise draw a "built for newer macOS" warning
+    // from ld on every build, burying anything real. build-quickjs.sh passes the
+    // same minimum when it builds the archive.
+    "macos-x64": {
+      "cflags": "-mmacosx-version-min=11.0",
+      "linked-libraries": ["quickjs"]
+    },
+    "macos-aarch64": {
+      "cflags": "-mmacosx-version-min=11.0",
+      "linked-libraries": ["quickjs"]
+    },
+    "linux-x64": {
+      "linked-libraries": ["quickjs"]
+    },
+    "linux-aarch64": {
+      "linked-libraries": ["quickjs"]
+    },
+    // Cross-built from macOS with mingw-w64 as the C compiler, then linked
+    // against the MSVC CRT c3c downloads. The cflags are what let mingw's
+    // objects do that: they stop stdio redirecting into libmingwex and stop gcc
+    // emitting libssp/libgcc calls. A consumer needs the same compiler for the
+    // shim: `c3c build <t> --target windows-x64 --cc x86_64-w64-mingw32-gcc`.
+    // c3c's other Windows target, mingw-x64, cannot link even a hello world on
+    // 0.8.2, so it is not listed.
+    "windows-x64": {
+      "cflags": "-D__USE_MINGW_ANSI_STDIO=0 -fno-stack-protector -mno-stack-arg-probe",
+      "linked-libraries": ["quickjs"]
+    }
   }
 }

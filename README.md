@@ -1,8 +1,79 @@
 # quickjs.c3
 
-[quickjs-ng](https://github.com/quickjs-ng/quickjs) as a C3 library. The engine's C
-sources are vendored and built by `c3c` itself — there is no static library to
-build first, no CMake step, and nothing to install.
+[quickjs-ng](https://github.com/quickjs-ng/quickjs) as a C3 library. The engine is
+a git submodule at `vendor/quickjs-ng`, not a copy in this tree — no CMake step
+and nothing to install.
+
+```sh
+git clone --recursive <this repo>          # or, after a plain clone:
+git submodule update --init --recursive
+```
+
+The gitlink is the version record: it names the exact upstream commit, and `git
+diff` shows an engine bump as one line instead of eighty thousand. Note that a
+submodule *pins* — `--recursive` fetches the commit this library was built and
+tested against, which is the point. Move it deliberately:
+
+```sh
+git -C vendor/quickjs-ng fetch && git -C vendor/quickjs-ng checkout <commit>
+native/build-quickjs.sh <targets…>          # rebuild the archives
+c3c test                                    # then commit both
+```
+
+Consumers link a prebuilt `lib/<target>/libquickjs.a` rather than compiling the
+engine, because `c3c` has no object cache and `quickjs.c` is 2 MB of C: as a
+`c-sources` entry it cost ~4.2 s on *every* build of the consuming app, changes or
+not. The archive is committed for the targets under `lib/`; on any other platform,
+run `native/build-quickjs.sh` once and commit what it writes. `native/qjs_shim.c`
+is **not** in the archive — it is the file this binding edits, it compiles in
+0.03 s, and archiving it would mean re-running the script after every change. It
+does `#include "quickjs.h"`, so the submodule has to be checked out even though
+the engine is linked rather than compiled.
+
+Developing the binding builds the engine from source instead: `project.json`
+points its `c-sources` at `vendor/quickjs-ng`, so `c3c test` here compiles against
+the exact upstream the gitlink names, and an engine bump that breaks the shim
+fails in this repo rather than in somebody's app.
+
+## Building an archive for another target
+
+**Give the compiler a target; don't expect `--target` to.** c3c never passes
+`-target` to the C compiler — it hands each `c-sources` file to whatever `--cc`
+names, defaulting to the host's, and archives the result without complaining. On
+0.8.2, `c3c build quickjs --target linux-x64` from an arm Mac reports success and
+writes an archive holding one ELF x86-64 object beside five Mach-O arm64 ones. The
+fix is a compiler already aimed at the target, which `--cc` selects.
+
+```sh
+native/build-quickjs.sh macos-aarch64 macos-x64   # Xcode clang, both slices
+native/build-quickjs.sh windows-x64               # needs mingw-w64
+native/build-quickjs.sh linux-x64                 # on Linux, or a linux cross-gcc
+```
+
+The script refuses any target whose compiler is missing rather than falling back
+to the host's and producing the wrong object format.
+
+**Windows** is cross-built from macOS and works end to end, but the arrangement is
+worth understanding. c3c links `windows-x64` with `lld-link` against the MSVC CRT
+it downloads to `~/.cache/c3/msvc_sdk` — 694 MB of import libraries with **zero
+headers**, since C3 needs no C headers. So clang cannot compile C for that ABI at
+all (`'stdlib.h' file not found`). mingw-w64 supplies the headers, and its objects
+link against the MSVC CRT once three flags stop them reaching for mingw's own
+runtime — `-D__USE_MINGW_ANSI_STDIO=0` (else printf redirects to
+`__mingw_vsnprintf` in libmingwex), `-fno-stack-protector` (libssp),
+`-mno-stack-arg-probe` (`___chkstk_ms` in libgcc). `manifest.json` carries them
+under `windows-x64` so `qjs_shim.c` gets them too, and a consumer builds with:
+
+```sh
+c3c build <target> --target windows-x64 --cc x86_64-w64-mingw32-gcc
+```
+
+Verified to a 1.6 MB PE32+ console binary with the engine linked in; not executed,
+since that needs a Windows box.
+
+c3c's other Windows target, `mingw-x64`, is not shipped: on 0.8.2 it cannot link
+even a hello world from macOS, because its own `std.io` objects call
+`___chkstk_ms` and the link provides no libgcc. That is upstream, not here.
 
 ```c3
 import qjs;

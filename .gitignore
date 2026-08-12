@@ -56,3 +56,9 @@ dkms.conf
 
 # Standalone build output
 build/
+
+# ...except the frozen quickjs-ng archives, which the rules above would sweep up
+# (*.a and *.lib). These are deliberately committed: consumers link them instead
+# of recompiling 2 MB of C on every build. Rebuild with native/build-quickjs.sh.
+!lib/*/*.a
+!lib/*/*.lib
