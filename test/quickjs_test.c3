@@ -18,8 +18,8 @@
 module quickjs_tests;
 
 import qjs;
-import std::core::mem;
-import std::core::mem::allocator;
+
+
 import std::core::test;
 import std::math;
 

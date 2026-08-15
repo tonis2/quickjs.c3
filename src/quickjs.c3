@@ -21,9 +21,8 @@
 *>
 module qjs;
 
-import std::core::mem;
-import std::core::mem::allocator;
-import std::core::string;
+
+
 
 // The tags a value can carry. Only the ones a caller has any business branching
 // on are named; the rest are internal to the engine and arrive as `OTHER`.
