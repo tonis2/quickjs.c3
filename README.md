@@ -143,8 +143,12 @@ compiled sources finds nothing to call. The shim re-exports them as real symbols
 Every `Value` handed back is the caller's, and is released once with
 `Context.release`. `defer` immediately after is the only sane way to write it.
 
-`Context.set_property` **takes** ownership of the value it is given, matching the
-engine's own rule — do not release that one.
+`Context.set_property` and `Context.accessor` **take** ownership of the values they
+are given, matching the engine's own rule — do not release those.
+
+`Context.call` is the other way round and worth reading twice, because it sits
+next to them: the function, the receiver and every argument are all **borrowed**
+and stay the caller's. Only its answer is owned.
 
 Strings returned by `Context.text` and `Context.exception` are allocated from the
 allocator passed in, **including when they come back empty**, so they are freed
@@ -190,8 +194,9 @@ used from another thread.
 c3c test
 ```
 
-Ten checks covering the value round-trips (which are the ABI checks), exceptions
-and their stack traces, all three limits, and the job queue.
+Two dozen checks covering the value round-trips in all three directions (which
+are the ABI checks), host functions and calls back into a script, exceptions and
+their stack traces, shared buffers, all three limits, and the job queue.
 
 ## Licence
 

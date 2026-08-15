@@ -784,3 +784,220 @@ fn void a_frozen_buffer_can_be_read_but_not_written() @test
 	defer alloc::free(mem, why.ptr);
 	test::@check(why.contains("immutable"), "saying which buffer it is (%s)", why);
 }
+
+<*
+ A function the script defined is callable from here, with arguments.
+
+ The third direction across the boundary, and the last one missing: values
+ written here and read by the engine (`eval`), values written by the engine and
+ read here (`text`, `number`), values the engine writes and a host function
+ reads (`adds_up`) — and now values written here that the engine hands to a
+ script as arguments. A host loop that ticks a script once a frame is this call
+ and nothing else.
+*>
+fn void a_host_can_call_a_function_the_script_defined() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value? defined = js.eval("function blend(a, b) { return a * 0.25 + b * 0.75 }");
+	if (catch defined) { test::@check(false, "the script defines it"); return; }
+	js.release(defined);
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+
+	qjs::Value blend = js.property(global, "blend");
+	defer js.release(blend);
+	test::@check(js.is_function(blend), "and the host finds it on the global");
+
+	// Numbers are inline values with nothing allocated behind them, so these
+	// need no release. The borrow rule is the point rather than the leak: `call`
+	// does not consume its arguments, and an object among them would still be
+	// the caller's afterwards.
+	qjs::Value[2] args = { qjs::number_value(4), qjs::number_value(8) };
+	qjs::Value? answer = js.call(blend, qjs::undefined_value(), args[..]);
+	if (catch answer) { test::@check(false, "the call runs"); return; }
+	defer js.release(answer);
+	test::@check(math::abs(js.number(answer) - 7.0) < 1e-12,
+		"both arguments crossed and the answer came back (%.4f, wanted 7)", js.number(answer));
+
+	// Again, because a call that consumed its function would work exactly once
+	// and then read a released object — a frame-two crash for a hook resolved on
+	// frame one, which is the shape of bug this binding's pointer discipline is
+	// for.
+	qjs::Value? again = js.call(blend, qjs::undefined_value(), args[..]);
+	if (catch again) { test::@check(false, "the same function is still callable"); return; }
+	defer js.release(again);
+	test::@check(math::abs(js.number(again) - 7.0) < 1e-12,
+		"with the same answer the second time (%.4f)", js.number(again));
+
+	// A function made on this side is callable from this side too, which is what
+	// a prelude wrapping a host call in JavaScript ends up handing back.
+	qjs::Value hosted = js.function(&adds_up, "addsUp", 2);
+	defer js.release(hosted);
+	test::@check(js.is_function(hosted), "a host-made function is one as well");
+}
+
+<*
+ And it can be given a receiver, which is what makes a method callable.
+*>
+fn void a_call_can_choose_its_receiver() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value? defined = js.eval("function label() { return this.joint }");
+	if (catch defined) { test::@check(false, "the script defines it"); return; }
+	js.release(defined);
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+
+	qjs::Value label = js.property(global, "label");
+	defer js.release(label);
+
+	qjs::Value receiver = js.object();
+	defer js.release(receiver);
+	js.set_property(receiver, "joint", js.string("left_hand"));
+
+	qjs::Value? answer = js.call(label, receiver);
+	if (catch answer) { test::@check(false, "the call runs"); return; }
+	defer js.release(answer);
+
+	String text = js.text(answer);
+	defer alloc::free(mem, text.ptr);
+	test::@check(text == "left_hand", "the function saw the receiver it was given (%s)", text);
+
+	// Borrowed, not consumed: the receiver is still a live object here.
+	qjs::Value again = js.property(receiver, "joint");
+	defer js.release(again);
+	String still = js.text(again);
+	defer alloc::free(mem, still.ptr);
+	test::@check(still == "left_hand", "and the receiver survived the call (%s)", still);
+}
+
+<*
+ A throw inside the call is a fault here, and the engine keeps running.
+
+ Both halves matter for a script driving a scene: the host has to be able to put
+ the message on screen, and it has to be able to draw the next frame — a play
+ loop that tore down its engine on the first typo would be unusable.
+*>
+fn void a_call_that_throws_arrives_as_a_fault() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value? defined = js.eval("function boom() { throw new Error('no clip is bound') }");
+	if (catch defined) { test::@check(false, "the script defines it"); return; }
+	js.release(defined);
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+
+	qjs::Value boom = js.property(global, "boom");
+	defer js.release(boom);
+
+	qjs::Value? refused = js.call(boom);
+	test::@check(@catch(refused) == qjs::THREW, "the throw arrives as a fault, not a poisoned value");
+	if (try refused) js.release(refused);
+
+	String why = js.exception();
+	defer alloc::free(mem, why.ptr);
+	test::@check(why.contains("no clip is bound"), "carrying the script's own sentence (%s)", why);
+
+	qjs::Value? after = js.eval("1 + 1");
+	if (catch after) { test::@check(false, "the engine still runs afterwards"); return; }
+	defer js.release(after);
+	test::@check(js.number(after) == 2.0, "and answers (%.0f)", js.number(after));
+}
+
+<*
+ Calling something that is not a function is refused rather than jumped to.
+
+ The case a host reaches by looking for a hook the script never wrote, which is
+ the normal state of a script being edited — hence `is_function`, so absence can
+ be silence instead of an exception once a frame.
+*>
+fn void calling_something_that_is_not_a_function_is_refused() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	js.set_property(global, "update", qjs::number_value(3));
+
+	qjs::Value hook = js.property(global, "update");
+	defer js.release(hook);
+	test::@check(!js.is_function(hook), "a number is not callable");
+
+	qjs::Value missing = js.property(global, "neverDefined");
+	defer js.release(missing);
+	test::@check(!js.is_function(missing), "and neither is a name nothing ever wrote");
+
+	qjs::Value? refused = js.call(hook);
+	test::@check(@catch(refused) == qjs::THREW, "calling one is a fault rather than a jump into a number");
+	if (try refused) js.release(refused);
+
+	String why = js.exception();
+	defer alloc::free(mem, why.ptr);
+	test::@check(why.contains("not a function"), "saying what was wrong with it (%s)", why);
+}
+
+<*
+ Source that is not zero-terminated still parses.
+
+ `JS_Eval` and `JS_ParseJSON` both document `buf[len] == '\0'` as a requirement,
+ and a `String` in C3 makes no such promise: a literal has one because the
+ compiler puts it there, and a slice of a file read off disk does not. The
+ binding copies rather than trusting, which is what this pins down.
+
+ Built as a slice of a longer buffer with deliberate garbage after it, because
+ that is the shape of the bug: the engine reads one byte past the end and parses
+ it, and what comes back is a `SyntaxError` about a byte the caller never wrote.
+ A heap allocation that happened to be followed by a zero would pass either way,
+ which is why this cannot be left to a plain string.
+*>
+fn void source_that_is_not_zero_terminated_still_parses() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	// `7 + 1` followed by something that would change the answer if it were read.
+	char[16] buffer = { '7', ' ', '+', ' ', '1', '2', '3', '4', '5', 0xC3, 0x28, 'x', 'x', 'x', 'x', 'x' };
+	String source = (String)buffer[:5];
+
+	qjs::Value? answer = js.eval(source);
+	if (catch answer)
+	{
+		String why = js.exception();
+		defer alloc::free(mem, why.ptr);
+		test::@check(false, "an unterminated source parsed (%s)", why);
+		return;
+	}
+	defer js.release(answer);
+	test::@check(js.number(answer) == 8.0,
+		"and stopped exactly at the length it was given (%.0f, wanted 8)", js.number(answer));
+
+	// The same for JSON, which carries the same requirement.
+	char[16] json = { '{', '"', 'a', '"', ':', '1', '}', ',', 'j', 'u', 'n', 'k', 0xFF, 0xFE, 0, 0 };
+	qjs::Value? parsed = js.from_json((String)json[:7]);
+	if (catch parsed) { test::@check(false, "an unterminated JSON body parsed"); return; }
+	defer js.release(parsed);
+
+	qjs::Value a = js.property(parsed, "a");
+	defer js.release(a);
+	test::@check(js.number(a) == 1.0, "with the object it described (%.0f)", js.number(a));
+}

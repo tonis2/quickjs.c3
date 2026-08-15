@@ -228,6 +228,25 @@ void qjs_new_function(JSContext *ctx, qjs_host_fn *cb, const char *name,
     out(JS_NewCClosure(ctx, closure_enter, name, closure_release, argc, 0, closure), slot);
 }
 
+/* --- calling ------------------------------------------------------------ */
+
+int qjs_is_function(JSContext *ctx, const QjsValue *v)
+{
+    return JS_IsFunction(ctx, in(v)) ? 1 : 0;
+}
+
+void qjs_call(JSContext *ctx, const QjsValue *fn, const QjsValue *this_val,
+              int argc, const QjsValue *argv, QjsValue *slot)
+{
+    /* The arguments cross as a pointer with no copy, the same way they do in
+       closure_enter and for the same reason: an array cannot go through the
+       union above one element at a time without allocating somewhere to put
+       it, and QjsValue is JSValue's sixteen bytes. The cast drops a const the
+       engine does not need — JS_Call's argv is spelled JSValueConst, which in
+       a normal build is JSValue itself. */
+    out(JS_Call(ctx, in(fn), in(this_val), argc, (JSValueConst *)argv), slot);
+}
+
 /* --- errors ------------------------------------------------------------- */
 
 void qjs_new_error(JSContext *ctx, const char *message, QjsValue *slot)

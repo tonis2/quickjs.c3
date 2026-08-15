@@ -149,6 +149,8 @@ extern fn int qjs_freeze_buffer(Value* buffer);
 extern fn void qjs_new_typed_array(ContextRef ctx, int kind, Value* buffer, usz offset, usz count, Value* out);
 
 extern fn void qjs_new_function(ContextRef ctx, HostFn cb, ZString name, int argc, void* opaque, Value* out);
+extern fn int qjs_is_function(ContextRef ctx, Value* v);
+extern fn void qjs_call(ContextRef ctx, Value* callee, Value* this_val, int argc, Value* args, Value* out);
 extern fn void qjs_new_error(ContextRef ctx, ZString message, Value* out);
 extern fn void qjs_throw(ContextRef ctx, Value* v, Value* out);
 
@@ -269,8 +271,18 @@ fn Value? Context.eval(&self, String source, String name = "<eval>", int type = 
 	ZString named = name.zstr_copy(mem);
 	defer alloc::free(mem, (void*)named);
 
+	// **Copied, always.** `JS_Eval` requires `input[input_len]` to be `\0` — it
+	// is a documented precondition, not a nicety — and a `String` in C3 carries
+	// no such promise: a literal happens to have one, a slice of a file read off
+	// disk does not, and there is no way to check without reading the byte the
+	// question is about. The failure is a parse of one byte of whatever follows
+	// the buffer, which surfaces as `SyntaxError: invalid UTF-8 sequence`
+	// somewhere no one will connect to it.
+	ZString text = source.zstr_copy(mem);
+	defer alloc::free(mem, (void*)text);
+
 	Value result;
-	qjs_eval(self.ctx, source.ptr, source.len, named, type, &result);
+	qjs_eval(self.ctx, (char*)text, source.len, named, type, &result);
 	if (qjs_is_exception(&result) != 0) return THREW~;
 	return result;
 }
@@ -427,8 +439,12 @@ fn Value? Context.from_json(&self, String text, String name = "<json>")
 	ZString named = name.zstr_copy(mem);
 	defer alloc::free(mem, (void*)named);
 
+	// Zero-terminated for the same documented reason `eval` copies — see there.
+	ZString body = text.zstr_copy(mem);
+	defer alloc::free(mem, (void*)body);
+
 	Value out;
-	qjs_json_parse(self.ctx, text.ptr, text.len, named, &out);
+	qjs_json_parse(self.ctx, (char*)body, text.len, named, &out);
 	if (qjs_is_exception(&out) != 0) return THREW~;
 	return out;
 }
@@ -645,6 +661,50 @@ fn Value Context.function(&self, HostFn body, ZString name, int arity = 0, void*
 {
 	Value out;
 	qjs_new_function(self.ctx, body, name, arity, opaque, &out);
+	return out;
+}
+
+<*
+ Whether `value` can be called — true for a function declared in a script, for
+ one made by `Context.function`, and for a class, which JavaScript counts as a
+ function too.
+
+ Worth asking before `Context.call` when the script is the user's rather than
+ the host's: a script that never defined the hook the host looks for should be
+ quiet, not throwing once a frame.
+*>
+fn bool Context.is_function(&self, Value value)
+{
+	return qjs_is_function(self.ctx, &value) != 0;
+}
+
+<*
+ Call a JavaScript function from here — the mirror of `Context.function`, and
+ what a host loop calling into a script once a frame needs.
+
+ 	`Value update = js.property(global, "update");`
+ 	`defer js.release(update);`
+ 	`if (js.is_function(update))`
+ 	`{`
+ 	`    Value[2] args = { qjs::number_value(dt), input };`
+ 	`    Value? answer = js.call(update, qjs::undefined_value(), args[..]);`
+ 	`}`
+
+ **Everything passed in is borrowed**, which is the opposite of the rule
+ `set_property` and `accessor` follow: the function, the receiver and every
+ argument are still the caller's to release afterwards. Only the answer is
+ owned by the caller.
+
+ @param this_val : `What the function sees as its receiver. Undefined is right for a plain function, and only a method reached through the host rather than through a property access needs anything else.`
+ @param args : `The arguments, in order. Passing more or fewer than the function declares is allowed, as it is from JavaScript.`
+ @return `Whatever the function returned, owned by the caller.`
+ @return? THREW : `It threw, or was not callable at all; Context.exception has the message.`
+*>
+fn Value? Context.call(&self, Value function, Value this_val = undefined_value(), Value[] args = {})
+{
+	Value out;
+	qjs_call(self.ctx, &function, &this_val, (int)args.len, args.ptr, &out);
+	if (qjs_is_exception(&out) != 0) return THREW~;
 	return out;
 }
 

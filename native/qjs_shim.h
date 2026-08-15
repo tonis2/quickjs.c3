@@ -151,6 +151,26 @@ typedef void qjs_host_fn(JSContext *ctx, const QjsValue *this_val, int argc,
 void qjs_new_function(JSContext *ctx, qjs_host_fn *cb, const char *name,
                       int argc, void *opaque, QjsValue *out);
 
+/* --- calling ------------------------------------------------------------ */
+
+int qjs_is_function(JSContext *ctx, const QjsValue *v);
+
+/*
+ * Call *fn with *this_val as `this` and `argc` arguments from `argv`.
+ *
+ * The mirror of qjs_new_function: that one lets JavaScript call the host, this
+ * one lets the host call JavaScript, which is what a per-frame `update(dt)`
+ * needs. Everything in is **borrowed** — the function, the receiver and every
+ * argument stay the caller's to release, which is not the rule qjs_set_prop
+ * and qjs_define_getset follow, so it is worth reading twice.
+ *
+ * `out` receives the result, owned by the caller, or the exception sentinel if
+ * the call threw — which includes the case where *fn is not callable at all.
+ * Pass undefined for `this_val` when the function does not care.
+ */
+void qjs_call(JSContext *ctx, const QjsValue *fn, const QjsValue *this_val,
+              int argc, const QjsValue *argv, QjsValue *out);
+
 /* --- errors ------------------------------------------------------------- */
 
 /* An Error object with `message` set, owned by the caller. */
