@@ -201,4 +201,63 @@ void qjs_eval(JSContext *ctx, const char *src, size_t len, const char *filename,
 /* The pending exception, cleared. Undefined when there is none. */
 void qjs_take_exception(JSContext *ctx, QjsValue *out);
 
+/* --- modules ------------------------------------------------------------ */
+
+/*
+ * Resolve `name` as it was written in an import, against `base` — the resolved
+ * specifier of the module doing the importing, or the entry module's own name
+ * at the top level.
+ *
+ * Write the resolved specifier into `out`, which has room for `out_size` bytes
+ * including the terminator, and return 0. Return non-zero to refuse, which the
+ * engine reports as a ReferenceError naming what was asked for.
+ *
+ * This is where a host confines resolution to a directory. quickjs's own
+ * normalizer is happy to walk anywhere the filesystem goes.
+ */
+typedef int qjs_module_normalize_fn(const char *base, const char *name,
+                                    char *out, size_t out_size, void *opaque);
+
+/*
+ * Hand back the source of the module named by `name`, which is always a
+ * specifier the normalizer produced, and write its byte length to `len_out`.
+ *
+ * **The buffer is borrowed**: the shim copies it before compiling, so a host may
+ * hand over storage it overwrites on the very next call. That copy is not
+ * defensive tidiness — **module loads nest**, because compiling a module
+ * resolves its own imports, so without it a two-deep import chain compiles the
+ * inner module's bytes as the outer one's tail.
+ *
+ * Return NULL when there is nothing to load; the engine reports a
+ * ReferenceError naming the module.
+ */
+typedef const char *qjs_module_load_fn(const char *name, size_t *len_out,
+                                       void *opaque);
+
+/*
+ * The two callbacks and their opaque, in storage **the caller owns and must
+ * keep alive and unmoved for as long as the runtime is**. quickjs holds one
+ * opaque pointer for both hooks, so something has to carry the pair; making it
+ * the caller's memory is what keeps this shim free of per-runtime state and
+ * lets one process run more than one engine.
+ */
+typedef struct QjsModuleHooks {
+    qjs_module_normalize_fn *normalize;
+    qjs_module_load_fn *load;
+    void *opaque;
+} QjsModuleHooks;
+
+/*
+ * Install `hooks`, or pass NULL to leave modules unresolvable.
+ *
+ * Without this, source evaluated as QJS_EVAL_MODULE parses and then dies at the
+ * first `import` with no loader — which reads as a mysterious failure rather
+ * than a missing feature, because the parse succeeded.
+ *
+ * A NULL `normalize` inside `hooks` takes quickjs's own normalizer, which
+ * resolves relative specifiers against the importer and is not confined to
+ * anything.
+ */
+void qjs_set_module_loader(JSRuntime *rt, QjsModuleHooks *hooks);
+
 #endif /* QJS_SHIM_H */

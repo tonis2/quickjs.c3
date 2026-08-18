@@ -1001,3 +1001,243 @@ fn void source_that_is_not_zero_terminated_still_parses() @test
 	defer js.release(a);
 	test::@check(js.number(a) == 1.0, "with the object it described (%.0f)", js.number(a));
 }
+
+// ---------------------------------------------------------------------------
+// Modules.
+//
+// A fake filesystem, because the thing under test is the loader protocol and
+// not anybody's directory layout. `names` and `sources` are parallel; both hold
+// literals, whose bytes are static, which is what makes returning a pointer
+// into one of them from `fake_load` correct without any lifetime bookkeeping.
+
+struct FakeModules
+{
+	String[] names;
+	String[] sources;
+	// What the last normalize call was told the importer was. Kept so a test can
+	// assert the base is real rather than empty — a loader handed "" for every
+	// import cannot resolve a relative specifier, and would look fine until the
+	// first subdirectory.
+	char[256] last_base;
+	usz normalize_calls;
+	bool refuse;
+	// Every load is answered out of this one buffer, overwritten each time.
+	// The shim documents the source as borrowed and compiled during the call;
+	// if it ever retained the pointer instead, a two-deep import would compile
+	// the *inner* module's bytes twice and `a_module_can_import_another` would
+	// stop resolving. A fake that returned its literals directly could not tell
+	// the difference, because a literal's bytes are static and never move.
+	char[512] scratch;
+}
+
+fn int fake_normalize(ZString base, ZString name, char* out, usz out_size, void* opaque) @local
+{
+	FakeModules* store = (FakeModules*)opaque;
+	store.normalize_calls++;
+
+	String seen = base.str_view();
+	usz kept = seen.len < 255 ? seen.len : 255;
+	for (usz i = 0; i < kept; i++) store.last_base[i] = seen[i];
+	store.last_base[kept] = 0;
+
+	if (store.refuse) return -1;
+
+	// The name is the key: this fake has no directories to resolve against.
+	String want = name.str_view();
+	if (want.len + 1 > out_size) return -1;
+	for (usz i = 0; i < want.len; i++) out[i] = want[i];
+	out[want.len] = 0;
+	return 0;
+}
+
+fn char* fake_load(ZString name, usz* len_out, void* opaque) @local
+{
+	FakeModules* store = (FakeModules*)opaque;
+	String want = name.str_view();
+	foreach (i, known : store.names)
+	{
+		if (known == want)
+		{
+			String source = store.sources[i];
+			if (source.len > 512) return null;
+			for (usz b = 0; b < source.len; b++) store.scratch[b] = source[b];
+			*len_out = source.len;
+			return &store.scratch[0];
+		}
+	}
+	return null;
+}
+
+<*
+ Drive a module to completion.
+
+ Module evaluation hands back a promise even when nothing in it awaits, so a
+ test that stopped at `eval` would assert against a scene that had not run yet.
+*>
+macro @settle(js)
+{
+	while (js.jobs_waiting()) js.step_job();
+}
+
+fn void a_module_can_import_another() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	String[2] names = { "lib.js", "deeper.js" };
+	String[2] sources = {
+		"import { two } from 'deeper.js'; export const answer = 40 + two;",
+		"export const two = 2;",
+	};
+	FakeModules store = { .names = names[..], .sources = sources[..] };
+	qjs::ModuleHooks hooks = { .normalize = &fake_normalize, .load = &fake_load, .opaque = &store };
+	js.on_modules(&hooks);
+
+	qjs::Value? started = js.eval(
+		"import { answer } from 'lib.js'; globalThis.result = answer;",
+		"main.js", qjs::EVAL_MODULE);
+	if (catch started)
+	{
+		String why = js.exception();
+		defer alloc::free(mem, why.ptr);
+		test::@check(false, "the entry module evaluated (%s)", why);
+		return;
+	}
+	js.release(started);
+	@settle(js);
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	qjs::Value result = js.property(global, "result");
+	defer js.release(result);
+
+	test::@check(js.number(result) == 42.0,
+		"and the import chain resolved two deep (%.0f, wanted 42)", js.number(result));
+	test::@check(store.normalize_calls == 2,
+		"one normalize per import, not per module (%d)", store.normalize_calls);
+	test::@check(((ZString)&store.last_base[0]).str_view() == "lib.js",
+		"and the second import was resolved against the module that wrote it (%s)",
+		((ZString)&store.last_base[0]).str_view());
+}
+
+<*
+ An import the host refuses is refused, rather than falling through to a
+ filesystem the host never agreed to.
+
+ This is the check that a sandbox is a sandbox: `refuse` stands for any policy —
+ a path outside the assets root, a specifier with no extension, a bare name that
+ is not a real file — and what matters is that saying no is possible and lands
+ as an error the script can see.
+*>
+fn void an_import_the_host_refuses_never_reaches_the_loader() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	String[1] names = { "secrets.js" };
+	String[1] sources = { "export const key = 'must not be reachable';" };
+	FakeModules store = { .names = names[..], .sources = sources[..], .refuse = true };
+	qjs::ModuleHooks hooks = { .normalize = &fake_normalize, .load = &fake_load, .opaque = &store };
+	js.on_modules(&hooks);
+
+	qjs::Value? started = js.eval(
+		"import { key } from 'secrets.js'; globalThis.leaked = key;",
+		"main.js", qjs::EVAL_MODULE);
+	if (try started)
+	{
+		js.release(started);
+		@settle(js);
+		test::@check(false, "a refused import was allowed through");
+		return;
+	}
+
+	String why = js.exception();
+	defer alloc::free(mem, why.ptr);
+	test::@check(why.contains("secrets.js"),
+		"and the error names what was asked for (%s)", why);
+}
+
+<*
+ A module the loader cannot find is a `ReferenceError` naming it, not a crash
+ and not a silent empty module.
+*>
+fn void a_module_that_is_not_there_says_which() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	String[1] names = { "present.js" };
+	String[1] sources = { "export const x = 1;" };
+	FakeModules store = { .names = names[..], .sources = sources[..] };
+	qjs::ModuleHooks hooks = { .normalize = &fake_normalize, .load = &fake_load, .opaque = &store };
+	js.on_modules(&hooks);
+
+	qjs::Value? started = js.eval("import { x } from 'absent.js';", "main.js", qjs::EVAL_MODULE);
+	if (try started)
+	{
+		js.release(started);
+		test::@check(false, "an import of a module that does not exist succeeded");
+		return;
+	}
+
+	String why = js.exception();
+	defer alloc::free(mem, why.ptr);
+	test::@check(why.contains("absent.js"), "and the error names it (%s)", why);
+}
+
+<*
+ With no loader installed, an import fails — and this pins the behaviour that
+ made the feature worth building, because the failure does not mention modules.
+
+ The parse succeeds; the death arrives at link time from somewhere that names
+ neither `import` nor the missing loader. Anyone meeting it for the first time
+ reads it as a broken script rather than as a host that never installed a hook.
+*>
+fn void without_a_loader_an_import_fails() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value? started = js.eval("import { x } from 'anything.js';", "main.js", qjs::EVAL_MODULE);
+	if (try started)
+	{
+		js.release(started);
+		test::@check(false, "an import resolved with no loader installed");
+		return;
+	}
+	// Deliberately not asserting the message: it is quickjs's, it is unhelpful,
+	// and that unhelpfulness is the point rather than a contract.
+	String why = js.exception();
+	alloc::free(mem, why.ptr);
+}
+
+<*
+ A module may be evaluated with no imports at all, which is the case a host hits
+ first and the one most likely to be broken by an over-eager loader.
+*>
+fn void a_module_with_no_imports_needs_no_loader() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value? started = js.eval("globalThis.ran = 7;", "main.js", qjs::EVAL_MODULE);
+	if (catch started) { test::@check(false, "a module with no imports evaluated"); return; }
+	js.release(started);
+	@settle(js);
+
+	qjs::Value global = js.global();
+	defer js.release(global);
+	qjs::Value ran = js.property(global, "ran");
+	defer js.release(ran);
+	test::@check(js.number(ran) == 7.0, "and its top level ran (%.0f)", js.number(ran));
+}

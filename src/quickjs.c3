@@ -92,6 +92,55 @@ alias InterruptFn = fn int(Runtime rt, void* opaque);
 *>
 alias HostFn = fn void(ContextRef ctx, Value* this_val, int argc, Value* args, void* opaque, Value* out);
 
+<*
+ Resolve an import specifier, or refuse it.
+
+ `base` is the resolved specifier of the module doing the importing — the entry
+ module's own name at the top level — and `name` is the text between the quotes.
+ Write the answer into `out`, which has room for `out_size` bytes including the
+ terminator, and return zero. Anything else refuses the import, and the engine
+ raises a `ReferenceError` naming what was asked for.
+
+ **This is where a host decides what a script may reach.** quickjs's own
+ normalizer resolves relative to the importer and stops nowhere; a loader that
+ wants imports confined to one directory confines them here, because by the time
+ the source is being loaded the decision has already been made.
+*>
+alias ModuleNormalizeFn = fn int(ZString base, ZString name, char* out, usz out_size, void* opaque);
+
+<*
+ Hand over a module's source.
+
+ `name` is always a specifier `ModuleNormalizeFn` produced. Write the byte
+ length to `len_out` and return the bytes, or null when there is nothing to
+ load.
+
+ **The buffer is borrowed**: the shim copies it before compiling, so returning
+ storage that is overwritten on the very next call is correct and is the cheapest
+ thing to do. That copy is what makes it correct — **module loads nest**, since
+ compiling a module resolves its own imports, and without it a two-deep chain
+ compiles the inner module's bytes as the outer one's tail.
+*>
+alias ModuleLoadFn = fn char*(ZString name, usz* len_out, void* opaque);
+
+<*
+ The pair of hooks and their opaque.
+
+ **The caller owns this and must keep it alive and unmoved for as long as the
+ runtime is.** quickjs carries one opaque pointer for both hooks, so something
+ has to hold the pair; keeping it here rather than in the shim is what lets one
+ process run more than one engine, and is why this is a struct a caller declares
+ rather than three arguments it passes.
+
+ A null `normalize` takes quickjs's own, which is not confined to anything.
+*>
+struct ModuleHooks
+{
+	ModuleNormalizeFn normalize;
+	ModuleLoadFn load;
+	void* opaque;
+}
+
 // ---------------------------------------------------------------------------
 // The shim.
 
@@ -105,6 +154,7 @@ extern fn void qjs_set_memory_limit(Runtime rt, usz bytes);
 extern fn void qjs_set_max_stack_size(Runtime rt, usz bytes);
 extern fn void qjs_run_gc(Runtime rt);
 extern fn void qjs_set_interrupt_handler(Runtime rt, InterruptFn cb, void* opaque);
+extern fn void qjs_set_module_loader(Runtime rt, ModuleHooks* hooks);
 
 extern fn int qjs_job_pending(Runtime rt);
 extern fn int qjs_execute_pending_job(Runtime rt);
@@ -776,4 +826,22 @@ fn bool Context.jobs_waiting(&self) => qjs_job_pending(self.runtime) != 0;
 fn void Context.collect(&self)
 {
 	qjs_run_gc(self.runtime);
+}
+
+<*
+ Install the module loader, or clear it with null.
+
+ Until this is called, source evaluated with `EVAL_MODULE` **parses and then
+ dies at its first `import`** with no loader installed — which reads as a
+ mysterious failure rather than a missing feature, because the parse succeeded
+ and the error arrives from somewhere that never mentions modules.
+
+ 	`hooks = { .normalize = &resolve, .load = &read, .opaque = self };`
+ 	`js.on_modules(&hooks);   // hooks must outlive the context`
+
+ @param hooks : `Storage the caller owns and keeps alive and unmoved for the runtime's lifetime. Null leaves imports unresolvable.`
+*>
+fn void Context.on_modules(&self, ModuleHooks* hooks)
+{
+	qjs_set_module_loader(self.runtime, hooks);
 }

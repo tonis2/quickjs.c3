@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <string.h>
 
 #include "qjs_shim.h"
 #include "quickjs.h"
@@ -289,4 +290,76 @@ void qjs_eval(JSContext *ctx, const char *src, size_t len, const char *filename,
 void qjs_take_exception(JSContext *ctx, QjsValue *slot)
 {
     out(JS_GetException(ctx), slot);
+}
+
+/* --- modules ------------------------------------------------------------ */
+
+static char *module_normalize(JSContext *ctx, const char *base,
+                              const char *name, void *opaque)
+{
+    QjsModuleHooks *hooks = opaque;
+    /* Long enough for any path a filesystem will hand back, and a fixed buffer
+       rather than an allocation because the result is copied out immediately
+       anyway — the engine wants js_malloc'd memory it can js_free. */
+    char resolved[4096];
+
+    if (hooks->normalize(base, name, resolved, sizeof resolved,
+                         hooks->opaque) != 0) {
+        JS_ThrowReferenceError(ctx, "cannot import '%s' from '%s'", name, base);
+        return NULL;
+    }
+    return js_strdup(ctx, resolved);
+}
+
+static JSModuleDef *module_load(JSContext *ctx, const char *name, void *opaque)
+{
+    QjsModuleHooks *hooks = opaque;
+    size_t len = 0;
+    const char *src = hooks->load(name, &len, hooks->opaque);
+
+    if (src == NULL) {
+        JS_ThrowReferenceError(ctx, "could not load module '%s'", name);
+        return NULL;
+    }
+
+    /*
+     * Copied before compiling, because **module loads nest**: the JS_Eval below
+     * resolves this module's own imports while it runs, which calls back into
+     * the host loader, which is entitled to reuse its buffer. Compiling straight
+     * out of `src` reads a two-deep chain's inner source as if it were the outer
+     * one's tail — measured, as a SyntaxError about a string ending where nobody
+     * wrote an end.
+     *
+     * js_malloc rather than malloc so that an enormous module meets the
+     * runtime's memory limit rather than the process's.
+     */
+    char *owned = js_malloc(ctx, len + 1);
+    if (owned == NULL) return NULL;
+    memcpy(owned, src, len);
+    owned[len] = '\0';
+
+    /* COMPILE_ONLY stops before evaluation and hands back a value whose pointer
+       *is* the module — quickjs-libc's own loader does exactly this. Evaluating
+       here instead would run the imported module before the importer had linked
+       against it. */
+    JSValue compiled = JS_Eval(ctx, owned, len, name,
+                               JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    js_free(ctx, owned);
+    if (JS_IsException(compiled)) return NULL;
+
+    /* The module is already referenced by the engine, so this value is one
+       reference too many and freeing it is not the same as discarding it. */
+    JSModuleDef *m = JS_VALUE_GET_PTR(compiled);
+    JS_FreeValue(ctx, compiled);
+    return m;
+}
+
+void qjs_set_module_loader(JSRuntime *rt, QjsModuleHooks *hooks)
+{
+    if (hooks == NULL || hooks->load == NULL) {
+        JS_SetModuleLoaderFunc(rt, NULL, NULL, NULL);
+        return;
+    }
+    JS_SetModuleLoaderFunc(rt, hooks->normalize ? module_normalize : NULL,
+                           module_load, hooks);
 }
