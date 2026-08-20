@@ -725,6 +725,106 @@ fn void a_typed_array_shares_the_hosts_memory_until_it_is_detached() @test
 }
 
 <*
+ Bytes a *script* built, read by the host — the other direction.
+
+ `buffer` and `typed_array` hand the engine memory the host already had. This is
+ the reverse, and it is what a procedurally generated texture, a mesh built in
+ JavaScript, or a blob on its way to a file all need: the script is the one that
+ produced the bytes and the host has to get at them without a JSON copy or a
+ property read per element.
+
+ The subarray is the case worth having a test for. `JS_GetArrayBuffer` on a view
+ answers with the whole buffer underneath it, so a shim that reached for it first
+ would hand back the right *number* of bytes starting at the wrong place — a
+ picture shifted by an offset, which reads as a decoding bug rather than as a
+ binding one. `JS_GetUint8Array` accounts for the view; this asserts that it is
+ the one being used.
+*>
+fn void the_host_reads_bytes_a_script_built() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	qjs::Value? made = js.eval("new Uint8Array([10, 20, 30, 40, 50])");
+	if (catch made) { test::@check(false, "the script builds a Uint8Array"); return; }
+	qjs::Value array = made;
+	defer js.release(array);
+
+	char[] bytes = js.bytes(array);
+	test::@check(bytes.len == 5, "five bytes crossed, got %d", bytes.len);
+	test::@check(bytes.len == 5 && bytes[0] == 10 && bytes[4] == 50,
+		"and they are the script's own values");
+
+	// A view that starts partway in. The pointer must be the view's first
+	// element, not the buffer's.
+	qjs::Value? sliced = js.eval("new Uint8Array([1, 2, 3, 4, 5, 6]).subarray(2, 5)");
+	if (catch sliced) { test::@check(false, "the script builds a subarray"); return; }
+	qjs::Value view = sliced;
+	defer js.release(view);
+
+	char[] part = js.bytes(view);
+	test::@check(part.len == 3, "a three-element view is three bytes, got %d", part.len);
+	test::@check(part.len == 3 && part[0] == 3 && part[2] == 5,
+		"and it starts at the view's own first element, not the buffer's");
+
+	// A bare ArrayBuffer, which is the other thing a script may hand over.
+	qjs::Value? raw = js.eval("new Uint8Array([7, 8]).buffer");
+	if (catch raw) { test::@check(false, "the script builds an ArrayBuffer"); return; }
+	qjs::Value buffer = raw;
+	defer js.release(buffer);
+	test::@check(js.bytes(buffer).len == 2, "an ArrayBuffer reads too, got %d", js.bytes(buffer).len);
+}
+
+<*
+ Anything that is not bytes reads as no bytes, and leaves no exception behind.
+
+ The empty slice is how this reports, which puts the burden on the caller to
+ check — so the failure to guard against is the *quiet* one: `JS_GetUint8Array`
+ leaves a pending `TypeError` when handed something else, and a shim that did not
+ clear it would leave that exception standing for whatever unrelated call
+ happened to look for one next. The last check is the one that catches it: a
+ perfectly good script evaluated afterwards must still succeed.
+
+ A plain `Array` is in the list on purpose. It is the thing a script most easily
+ reaches for instead of a `Uint8Array`, it has no contiguous bytes to point at,
+ and answering with something for it would be answering with garbage.
+*>
+fn void what_is_not_bytes_reads_as_none() @test
+{
+	qjs::Context? opened = qjs::open(memory_limit: SMALL_HEAP);
+	if (catch opened) { test::@check(false, "the engine starts"); return; }
+	qjs::Context js = opened;
+	defer js.close();
+
+	String[5] sources = { "[1, 2, 3]", "'abc'", "42", "({ length: 3 })", "null" };
+	foreach (source : sources)
+	{
+		qjs::Value? made = js.eval(source);
+		if (catch made) { test::@check(false, "%s evaluates", source); continue; }
+		qjs::Value value = made;
+		defer js.release(value);
+		test::@check(js.bytes(value).len == 0, "%s has no bytes, got %d", source, js.bytes(value).len);
+	}
+
+	// **Asserted on the engine's exception slot, not on the next eval.**
+	// `JS_GetUint8Array` really does throw a TypeError on the way to returning
+	// NULL — quickjs.c:59893 — but a stale one does not make a later successful
+	// `eval` fail, so checking that `1 + 1` still works catches nothing. It was
+	// written that way first and passed with the clearing deleted.
+	//
+	// `exception()` reads the slot directly, and reading it also clears it, so
+	// this has to be the last thing here: it is a destructive observation.
+	String standing = js.exception();
+	defer alloc::free(mem, standing.ptr);
+	test::@check(standing.len == 0,
+		"a refusal left '%s' pending, which whatever looks for an exception next will report as its own",
+		standing
+	);
+}
+
+<*
  A shared buffer the script can read and cannot change.
 
  Sharing memory means a script sees the host's arrays; it should not also mean it

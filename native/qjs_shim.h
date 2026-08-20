@@ -132,6 +132,24 @@ int qjs_freeze_buffer(const QjsValue *buffer);
 void qjs_new_typed_array(JSContext *ctx, int kind, const QjsValue *buffer,
                          size_t offset, size_t count, QjsValue *out);
 
+/*
+ * The bytes behind a Uint8Array, a Uint8ClampedArray or an ArrayBuffer —
+ * the direction the three above do not go.
+ *
+ * Everything else here hands the engine memory the host already had.  This is
+ * the reverse: a script built the bytes and the host wants to read them.  The
+ * pointer is **borrowed and short-lived** — it is the engine's own storage, it
+ * moves if the array is resized and it is gone when the value is collected, so
+ * copy out of it before returning to JavaScript rather than keeping it.
+ *
+ * A typed array with a byte offset is handled: the pointer is to the view's
+ * first element, not to the start of the buffer under it.  Returns NULL with
+ * *len = 0 for anything that is not one of the three, including a plain Array —
+ * telling those apart is the caller's job and the point is that this cannot
+ * quietly succeed on the wrong kind of value.
+ */
+uint8_t *qjs_get_bytes(JSContext *ctx, const QjsValue *v, size_t *len);
+
 /* --- host functions ----------------------------------------------------- */
 
 /*

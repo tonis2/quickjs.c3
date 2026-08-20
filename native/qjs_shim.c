@@ -187,6 +187,31 @@ void qjs_new_typed_array(JSContext *ctx, int kind, const QjsValue *buffer,
     JS_FreeValue(ctx, argv[2]);
 }
 
+uint8_t *qjs_get_bytes(JSContext *ctx, const QjsValue *v, size_t *len)
+{
+    *len = 0;
+
+    /* Uint8Array first, because it is what a script that means "bytes" builds
+       and because this one call already accounts for the view's byte offset —
+       JS_GetArrayBuffer on the same value would answer with the whole buffer
+       underneath it, which for a subarray is the wrong bytes rather than none. */
+    size_t size = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &size, in(v));
+    if (bytes) { *len = size; return bytes; }
+
+    /* JS_GetUint8Array leaves a pending TypeError when the value is not one.
+       Cleared rather than propagated: this function reports by returning NULL,
+       and an exception left standing here would surface later at whatever
+       unrelated call happened to check for one next. */
+    JS_FreeValue(ctx, JS_GetException(ctx));
+
+    bytes = JS_GetArrayBuffer(ctx, &size, in(v));
+    if (bytes) { *len = size; return bytes; }
+    JS_FreeValue(ctx, JS_GetException(ctx));
+
+    return NULL;
+}
+
 /* --- host functions ----------------------------------------------------- */
 
 /* JS_NewCClosure carries one void* and calls a finalizer on it when the function

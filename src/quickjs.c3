@@ -196,6 +196,7 @@ extern fn void qjs_new_buffer(ContextRef ctx, char* data, usz len, Value* out);
 extern fn void qjs_detach_buffer(ContextRef ctx, Value* buffer);
 extern fn int qjs_freeze_buffer(Value* buffer);
 extern fn void qjs_new_typed_array(ContextRef ctx, int kind, Value* buffer, usz offset, usz count, Value* out);
+extern fn char* qjs_get_bytes(ContextRef ctx, Value* v, usz* len);
 
 extern fn void qjs_new_function(ContextRef ctx, HostFn cb, ZString name, int argc, void* opaque, Value* out);
 extern fn int qjs_is_function(ContextRef ctx, Value* v);
@@ -655,6 +656,36 @@ fn Value Context.typed_array(&self, int kind, Value buffer, usz offset, usz coun
 	Value out;
 	qjs_new_typed_array(self.ctx, kind, &buffer, offset, count, &out);
 	return out;
+}
+
+<*
+ The bytes behind a `Uint8Array`, a `Uint8ClampedArray` or an `ArrayBuffer` —
+ the direction `buffer` and `typed_array` do not go.
+
+ Those two hand the engine memory the host already had. This is the reverse: a
+ script built the bytes and the host wants to read them, which is what a
+ procedurally generated texture, a mesh built in JavaScript or a blob about to
+ be written to a file all need.
+
+ **Borrowed, and short-lived.** The slice points into the engine's own storage:
+ it moves if the array is resized and it is gone when the value is collected.
+ Copy out of it before returning to JavaScript; do not keep it.
+
+ A view with a byte offset answers with its own first element rather than with
+ the start of the buffer underneath, so `array.subarray(4)` reads as the script
+ would expect rather than four bytes early.
+
+ 	`char[] pixels = js.bytes(args[0]);`
+ 	`if (pixels.len != width * height * 4) { ... }`
+
+ @return `An empty slice for anything that is not one of the three — including a plain Array, which has no contiguous bytes to point at.`
+*>
+fn char[] Context.bytes(&self, Value value)
+{
+	usz len = 0;
+	char* raw = qjs_get_bytes(self.ctx, &value, &len);
+	if (raw == null || len == 0) return {};
+	return raw[:len];
 }
 
 fn Value number_value(double d)
